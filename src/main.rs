@@ -5,7 +5,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    time::sleep,
+};
 use tracing::{error, info, warn};
 
 const PRESENCE_API: &str = "https://slack.com/api/users.setPresence";
@@ -220,6 +224,45 @@ async fn apply_with_retry(client: &Client, cfg: &Config, presence: Presence) {
     error!("giving up after retries; will catch up at next transition");
 }
 
+/// Bind a tiny HTTP server so the platform's port scan / health check sees an open
+/// port. The daemon needs no inbound traffic; this exists solely for the host.
+async fn spawn_health_server() -> Result<()> {
+    let port: u16 = env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+    let addr = format!("0.0.0.0:{port}");
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("failed to bind health server on {addr}"))?;
+    info!(%addr, "health server listening");
+
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut socket, _)) => {
+                    tokio::spawn(async move {
+                        // Best-effort drain of the request, then a fixed 200 OK.
+                        let mut buf = [0u8; 1024];
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf))
+                                .await;
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                                  Content-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+                Err(e) => warn!(error = %e, "health server accept failed"),
+            }
+        }
+    });
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -239,6 +282,8 @@ async fn main() -> Result<()> {
     );
 
     let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
+
+    spawn_health_server().await?;
 
     let now = Local::now();
     let desired = cfg.presence_for(&now);
